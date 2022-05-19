@@ -2,14 +2,21 @@
 
 package trie
 
-import "fmt"
+import (
+	"container/heap"
+	"fmt"
+	"sync"
+)
 
 // Node is a single element within the Trie
 type Node struct {
-	data  rune
-	child map[rune]*Node
-	flag  bool // 当前是否为词语的结尾
-	count int  // 累计查找次数(用于排序)
+	father *Node // 双向关系
+	data   rune
+	child  map[rune]*Node
+	size   int32 // 统计子树完整串数量
+	count  int32 // 累计查找次数(用于排序)，这个是以这个词为结尾的句子个数 : int32 = rune
+	max    int32 // 维护子树中最大 count, 部分节点可能 count = 0, 但是 max 有值，这表明它是一个非结尾，但是它下面有结尾
+	//flag  bool // 当前是否为词语的结尾 不需要了
 	//countToday int // 当日查找次数
 }
 
@@ -20,17 +27,18 @@ func newNode() *Node {
 
 // string returns a string describe Node
 func (n *Node) string() string {
-	return fmt.Sprintf("Node: {data: %s, flag: %v, count: %d, child: %v}", string(n.data), n.flag, n.count, n.child)
+	return fmt.Sprintf("Node: {data: %s, count: %d, child: %v}", string(n.data), n.count, n.child)
 }
 
 // Trie holds elements of the Trie tree.
 type Trie struct {
 	size int
 	root *Node
+	sync.Mutex
 }
 
-// get a new Trie
-func newTrie() *Trie {
+// NewTrie get a new Trie
+func NewTrie() *Trie {
 	return &Trie{root: newNode()}
 }
 
@@ -59,66 +67,231 @@ func (t *Trie) clear() {
 	t.root = nil // 自动 GC
 }
 
-// insert bytes into Trie
-func (t *Trie) insertBytes(bytes []byte) {
+// InsertBytes insert bytes into Trie
+func (t *Trie) InsertBytes(bytes []byte) {
 	str := string(bytes)
-	t.insertString(str)
+	t.InsertString(str)
 }
 
-// insert string into Trie
-func (t *Trie) insertString(str string) {
+// InsertString insert string into Trie
+func (t *Trie) InsertString(str string) {
 	runes := []rune(str)
-	t.insertRunes(runes)
+	t.InsertRunes(runes)
 }
 
-// insert runes into Trie
-func (t *Trie) insertRunes(runes []rune) {
+// InsertRunes insert runes into Trie
+func (t *Trie) InsertRunes(runes []rune) {
+	t.insertRunesWithCount(runes, 1)
+}
+
+// insert runes into Trie with count
+func (t *Trie) insertRunesWithCount(runes []rune, count int32) {
 	if len(runes) == 0 {
 		return
 	}
 	now := t.root
+	stack := make([]*Node, len(runes))
+	flag := false
 	for _, val := range runes {
 		nxt, ok := now.child[val]
 		if !ok {
 			nxt = newNode()
 			nxt.data = val
 			now.child[val] = nxt
+			nxt.father = now
 			t.size += 1
 		}
+		// 递归维护 max, size
+		defer func(now *Node, nxt *Node, flag *bool) {
+			if nxt.max > now.max {
+				now.max = nxt.max
+			}
+			if *flag {
+				now.size += 1
+			}
+		}(now, nxt, &flag)
 		now = nxt
-		now.count += 1
+		stack = append(stack, now)
 	}
-	now.flag = true
+	if now.count == 0 { // 第一次成为完整串, 贡献一个 size
+		now.size += 1
+		flag = true
+	}
+	now.count += count // 此句出现count次
+
+	// 维护每个节点的 max
+	// 通过一个数组维护树上路径, 从后往前更新 max
+	// 这里有一个问题: 对于树上维护一个数据，是 for + [] + for 快 还是 dfs + return 快呢
+	// 也就是说通过 dfs 实现 push 操作是否比 非dfs 快
+	//for i := len(runes) - 2; i >= 0; i-- {
+	//	if stack[i].max < stack[i+1].max {
+	//		stack[i].max = stack[i+1].max
+	//	} else { // 不是最大，不必再 push 上去了
+	//		break
+	//	}
+	//}
 }
 
 // find the last character in string from Trie.
 // If not find, return nil
-func (t *Trie) findByString(str string) *Node {
+func (t *Trie) findByString(str string) (*Node, int32) {
 	runes := []rune(str)
 	return t.findByRunes(runes)
 }
 
 // find the last character in bytes from Trie.
 // If not find, return nil
-func (t *Trie) findByBytes(bytes []byte) *Node {
+func (t *Trie) findByBytes(bytes []byte) (*Node, int32) {
 	str := string(bytes)
 	return t.findByString(str)
 }
 
 // find the last character in runes from Trie
 // If not find, return nil
-func (t *Trie) findByRunes(runes []rune) *Node {
+func (t *Trie) findByRunes(runes []rune) (*Node, int32) {
 	if len(runes) == 0 {
-		return nil
+		return nil, 0
 	}
+	//defer t.InsertRunes(runes) // 查找之后插入此查询
 	now := t.root
+	deep := int32(0)
 	for _, val := range runes {
 		nxt, ok := now.child[val]
 		if !ok {
-			return nil
+			return now, deep
 		}
+		deep += 1
 		now = nxt
-		now.count += 1
 	}
-	return now
+	return now, deep
+}
+
+// Query is a heap sizeof 10, save related search
+type Query struct {
+	heap            Heap
+	addHeapNodeChan chan *heapNode
+	wait            sync.WaitGroup
+}
+
+func getPrefix(node *Node) *string {
+	str := ""
+	for node.father != nil {
+		defer func(str *string, node *Node) {
+			*str += string(node.data)
+		}(&str, node)
+		node = node.father
+	}
+	return &str
+}
+
+func (q *Query) insertNode() {
+	for node := range q.addHeapNodeChan {
+		heap.Push(&q.heap, node)
+		if q.heap.Len() > 10 {
+			heap.Pop(&q.heap)
+		}
+	}
+}
+
+// Search 这是母函数
+func (t *Trie) Search(runes []rune) []string {
+	//defer t.InsertRunes(runes) // 查找后插入数据
+	query := &Query{addHeapNodeChan: make(chan *heapNode, 10), heap: Heap{}}
+	node, deep := t.findByRunes(runes)
+
+	h := MaxHeap{}
+	heap.Push(&h, &heapNode{node: node, deep: deep})
+	for i := deep - 1; i > 0; i-- {
+		node = node.father
+		heap.Push(&h, &heapNode{node: node, deep: i})
+	}
+	for i := int32(1); i < int32(len(runes)); i++ {
+		node, deep := t.findByRunes(runes[i:])
+		heap.Push(&h, &heapNode{node: node, deep: deep})
+	}
+	sz := int32(0)
+	querys := make([]*heapNode, 0)
+	fmt.Println(h.Len())
+	for h.Len() > 0 { // max-heap
+		node := heap.Pop(&h)
+		querys = append(querys, node.(*heapNode))
+		sz += node.(*heapNode).node.size
+		if sz > 10 {
+			break
+		}
+	}
+
+	//go query.insertNode()
+	for _, node := range querys { // 按deep排序的node数组
+		query.getRelatedSearch(node.node, int32(len(runes))-node.deep)
+	}
+
+	//close(query.addHeapNodeChan)
+
+	//query.wait.Add(1)
+	//go t.getRelatedSearchByRunes(query, runes, deep)
+	//go query.insertNode()
+
+	//query.wait.Wait()
+	//close(query.addHeapNodeChan)
+
+	strings := make([]string, 0)
+	for _, node := range query.heap {
+		strings = append(strings, *getPrefix(node.node))
+	}
+
+	return strings
+
+	//for {
+	//	node := <-query.addHeapNodeChan
+	//	heap.Push(&query.heap, node)
+	//	if query.heap.Len() > 10 {
+	//		heap.Pop(&query.heap)
+	//	}
+	//}
+}
+
+// deep is correlation between substring and pattern string, zero means the highest.
+func (t *Trie) getRelatedSearchByRunes(query *Query, runes []rune, deep int32) {
+	//defer query.wait.Done()
+
+	if len(runes) == 0 {
+		return
+	}
+	now := t.root
+	newDeep := deep
+	for _, val := range runes {
+		nxt, ok := now.child[val]
+		if !ok {
+			break
+		}
+		newDeep -= 1
+		now = nxt
+		//defer t.getRelatedSearch(now) // 爆搜所有前缀, 暂不开启
+	}
+	//query.getRelatedSearch(now, newDeep) // 开启爆搜
+	//go t.getRelatedSearchByRunes(query, runes[1:], deep+1) // 递归搜索所有后缀, 最多 30 层
+}
+
+func (q *Query) getRelatedSearch(node *Node, deep int32) {
+	for _, v := range node.child { // 是否考虑作为整句的结尾可以获取相对更大的一个优先级
+		// 不要残句。。
+		if v.count != 0 {
+			if q.heap.Len() < 10 {
+				heap.Push(&q.heap, &heapNode{node: v, deep: deep})
+			} else {
+				node := &heapNode{node: v, deep: deep}
+				if !q.heap[0].compare(node) {
+					//q.addHeapNodeChan <- node // 放入 chan
+					heap.Push(&q.heap, node) // 先进后出
+					heap.Pop(&q.heap)
+				}
+			}
+		}
+
+		maxNode := &heapNode{node: &Node{count: v.max}, deep: deep}
+		if q.heap.Len() < 10 || !q.heap[0].compare(maxNode) {
+			q.getRelatedSearch(v, deep)
+		}
+	}
 }
